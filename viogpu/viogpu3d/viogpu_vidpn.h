@@ -82,6 +82,11 @@ class VioGpuVidPN
     void FixEdid(void);
     BOOLEAN GetEdids(void);
     int AddEdidModes(void);
+    void MarkModesDirty(void)
+    {
+        InterlockedExchange(&m_ModesDirty, TRUE);
+    }
+    BOOLEAN RefreshModesIfDirty(void);
     BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
     void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
 
@@ -146,6 +151,7 @@ class VioGpuVidPN
     USHORT m_CustomModeIndex;
     BYTE m_EDIDs[MAX_CHILDREN][EDID_RAW_BLOCK_SIZE];
     BOOLEAN m_bEDID;
+    volatile LONG m_ModesDirty = 0;
 
     DXGK_DISPLAY_INFORMATION m_SystemDisplayInfo;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_SystemDisplaySourceId;

@@ -485,8 +485,10 @@ VioGpuAdapter::QueryChildRelations(_Out_writes_bytes_(ChildRelationsSize) DXGK_C
     for (UINT ChildIndex = 0; ChildIndex < ChildRelationsCount; ++ChildIndex)
     {
         pChildRelations[ChildIndex].ChildDeviceType = TypeVideoOutput;
-        pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = IsVgaDevice() ? HpdAwarenessAlwaysConnected
-                                                                                   : HpdAwarenessInterruptible;
+        // The "monitor" on virtio-gpu is the SPICE client's window, so the child is hot-pluggable
+        // even on the VGA-compatible device.  HpdAwarenessAlwaysConnected makes the OS ignore
+        // StatusConnection notifications, and those are what carry a console resize to the guest.
+        pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = IsVgaDevice() ? D3DKMDT_VOT_INTERNAL
                                                                                                            : D3DKMDT_VOT_HD15;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
@@ -540,6 +542,10 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
 
     VIOGPU_ASSERT(pDeviceDescriptor != NULL);
     VIOGPU_ASSERT(ChildUid < MAX_CHILDREN);
+
+    // Windows is (re)reading the monitor descriptor.  If the host changed the scanout size,
+    // fetch the new EDID first so the OS builds its monitor modes from the requested timing.
+    vidpn.RefreshModesIfDirty();
     PBYTE edid = vidpn.GetEdidData(ChildUid);
 
     if (!edid)
@@ -2639,8 +2645,15 @@ void VioGpuAdapter::ConfigChanged(void)
         vidpn.GetDisplayInfo();
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(m_u32NumScanouts));
-        //        UpdateChildStatus(FALSE);
-        //        ProcessEdid();
+
+        // The SPICE client asked for a new size (the console window was resized).  The OS only
+        // re-reads the monitor EDID and re-enumerates its mode sets when the child transitions,
+        // so unplug/replug it: QueryDeviceDescriptor then serves the *new* EDID, whose preferred
+        // detailed timing is the requested size, and the desktop follows the window.
+        // The tables themselves are rebuilt lazily in RefreshModesIfDirty() -- see the comment
+        // there for why they must not be rebuilt from this thread.
+        vidpn.MarkModesDirty();
+        UpdateChildStatus(FALSE);
         UpdateChildStatus(TRUE);
     }
 }

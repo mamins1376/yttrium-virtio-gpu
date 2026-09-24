@@ -645,6 +645,25 @@ NTSTATUS VioGpuVidPN::GetModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
     return Status;
 }
 
+// The host signalled VIRTIO_GPU_EVENT_DISPLAY: the scanout size changed because the SPICE
+// client asked for a new one.  Re-issue GET_EDID and rebuild the mode tables, but only from
+// the Dxgk callbacks below -- they already own m_ModeInfo/m_ModeNumbers, so the tables are
+// never rebuilt from the config work thread while the VidPN interfaces are walking them.
+// (Refreshing from that thread is why the vendor's version of this was left commented out.)
+BOOLEAN VioGpuVidPN::RefreshModesIfDirty(void)
+{
+    PAGED_CODE();
+
+    if (!InterlockedExchange(&m_ModesDirty, FALSE))
+    {
+        return FALSE;
+    }
+
+    DbgPrint(TRACE_LEVEL_FATAL, ("%s: display event -> re-reading EDID, rebuilding modes\n", __FUNCTION__));
+    GetModeList(&m_CurrentModes[0].DispInfo); // GetEdids() -> AddEdidModes() -> new mode tables
+    return TRUE;
+}
+
 NTSTATUS VioGpuVidPN::SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode)
 {
     PAGED_CODE();
@@ -801,6 +820,8 @@ NTSTATUS VioGpuVidPN::IsSupportedVidPn(_Inout_ DXGKARG_ISSUPPORTEDVIDPN *pIsSupp
 {
     PAGED_CODE();
 
+    RefreshModesIfDirty();
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     VIOGPU_ASSERT(pIsSupportedVidPn != NULL);
@@ -894,6 +915,8 @@ NTSTATUS VioGpuVidPN::RecommendVidPnTopology(_In_ CONST DXGKARG_RECOMMENDVIDPNTO
 NTSTATUS VioGpuVidPN::RecommendMonitorModes(_In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes)
 {
     PAGED_CODE();
+
+    RefreshModesIfDirty();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
@@ -1159,6 +1182,8 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
 NTSTATUS VioGpuVidPN::EnumVidPnCofuncModality(_In_ CONST DXGKARG_ENUMVIDPNCOFUNCMODALITY *CONST pEnumCofuncModality)
 {
     PAGED_CODE();
+
+    RefreshModesIfDirty();
 
     // DbgBreakPoint();
 
