@@ -757,7 +757,13 @@ NTSTATUS VioGpuVidPN::BuildModeSnapshot(VIOGPU_MODE_SNAPSHOT **ppSnapshot)
     RtlCopyMemory(&pSnapshot->Modes[ModeCount], &pSnapshot->Modes[Preferred], sizeof(VIDEO_MODE_INFORMATION));
 
     // Fold in the size the host currently wants; this is what makes the desktop follow the window.
-    GetDisplayInfo(pSnapshot);
+    // On failure the custom slot keeps the preferred-mode copy seeded above, so the snapshot is
+    // still coherent (just not following the window) rather than carrying a zeroed entry.
+    if (!GetDisplayInfo(pSnapshot))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING,
+                 ("%s: no scanout reported a size, custom slot keeps the preferred mode\n", __FUNCTION__));
+    }
 
     pSnapshot->CurrentModeIndex =
         (pSnapshot->CustomModeIndex < pSnapshot->ModeCount) ? pSnapshot->CustomModeIndex : Preferred;
@@ -1851,6 +1857,14 @@ VOID VioGpuVidPN::BlackOutScreen(CURRENT_MODE *pCurrentMod)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
+// Fold the size the host currently wants into the snapshot's single custom slot.
+// Returns TRUE only if a usable size was obtained AND applied; FALSE otherwise (no scanout
+// reported a size, or the snapshot had nowhere to put it), so callers do not treat "the
+// fetch was attempted" as "a size is in the snapshot".
+//
+// MAX_CHILDREN == 1 (common/helper.h), so there is exactly one custom slot to fill: take the
+// FIRST scanout that reports a non-zero size and stop. The previous loop kept going and let
+// the last scanout win, which is only equivalent while exactly one scanout answers.
 BOOLEAN VioGpuVidPN::GetDisplayInfo(VIOGPU_MODE_SNAPSHOT *pSnapshot)
 {
     PAGED_CODE();
@@ -1862,25 +1876,30 @@ BOOLEAN VioGpuVidPN::GetDisplayInfo(VIOGPU_MODE_SNAPSHOT *pSnapshot)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
+    BOOLEAN Applied = FALSE;
     PGPU_VBUFFER vbuf = NULL;
     ULONG xres = 0;
     ULONG yres = 0;
 
     for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts; i++)
     {
-        if (m_pAdapter->ctrlQueue.AskDisplayInfo(&vbuf))
+        if (!m_pAdapter->ctrlQueue.AskDisplayInfo(&vbuf))
         {
-            m_pAdapter->ctrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
-            m_pAdapter->ctrlQueue.ReleaseBuffer(vbuf);
-            if (xres && yres)
-            {
-                DbgPrint(TRACE_LEVEL_FATAL, ("---> %s (%dx%d)\n", __FUNCTION__, xres, yres));
-                SetCustomDisplay(pSnapshot, (USHORT)xres, (USHORT)yres);
-            }
+            continue;
+        }
+        xres = 0;
+        yres = 0;
+        m_pAdapter->ctrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
+        m_pAdapter->ctrlQueue.ReleaseBuffer(vbuf);
+        if (xres && yres)
+        {
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s scanout %u (%dx%d)\n", __FUNCTION__, i, xres, yres));
+            Applied = SetCustomDisplay(pSnapshot, (USHORT)xres, (USHORT)yres);
+            break;
         }
     }
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
-    return TRUE;
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s: %s\n", __FUNCTION__, Applied ? "applied" : "no size"));
+    return Applied;
 }
 
 // Append (xres,yres) to a caller-owned bounded table unless it is already there.
@@ -2188,13 +2207,14 @@ void VioGpuVidPN::SetVideoModeInfo(PVIDEO_MODE_INFORMATION pMode, UINT Idx, PVIO
 
 // Record the size the SPICE client currently wants into the trailing table entry of the snapshot
 // being built.  A zero dimension means "no scanout", which must never become a 0x0 mode.
-void VioGpuVidPN::SetCustomDisplay(VIOGPU_MODE_SNAPSHOT *pSnapshot, _In_ USHORT xres, _In_ USHORT yres)
+// Returns TRUE if the entry was written.
+BOOLEAN VioGpuVidPN::SetCustomDisplay(VIOGPU_MODE_SNAPSHOT *pSnapshot, _In_ USHORT xres, _In_ USHORT yres)
 {
     PAGED_CODE();
 
     if (pSnapshot == NULL || pSnapshot->CustomModeIndex >= pSnapshot->ModeCount || xres == 0 || yres == 0)
     {
-        return;
+        return FALSE;
     }
 
     VIOGPU_DISP_MODE tmpModeInfo = {0};
@@ -2215,6 +2235,7 @@ void VioGpuVidPN::SetCustomDisplay(VIOGPU_MODE_SNAPSHOT *pSnapshot, _In_ USHORT 
               tmpModeInfo.YResolution));
 
     SetVideoModeInfo(&pSnapshot->Modes[pSnapshot->CustomModeIndex], pSnapshot->CustomModeIndex, &tmpModeInfo);
+    return TRUE;
 }
 
 PAGED_CODE_SEG_END
