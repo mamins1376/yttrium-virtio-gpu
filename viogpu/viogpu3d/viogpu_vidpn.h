@@ -101,7 +101,7 @@ class VioGpuVidPN
     void SetVideoModeInfo(PVIDEO_MODE_INFORMATION pMode, UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
     BOOLEAN GetDisplayInfo(VIOGPU_MODE_SNAPSHOT *pSnapshot);
     void FixEdid(UCHAR *pEdid);
-    BOOLEAN GetEdids(UCHAR (*Edids)[EDID_RAW_BLOCK_SIZE], BOOLEAN *pHasEdid);
+    BOOLEAN GetEdids(UCHAR (*Edids)[EDID_RAW_BLOCK_SIZE], UINT32 EdidCapacity, BOOLEAN *pHasEdid);
     int AddEdidModes(const UCHAR *Edid, VIOGPU_DISP_MODE *pModes, int Capacity);
     BOOLEAN UpdateModes(VIOGPU_DISP_MODE *pModes, int Capacity, int &cnt, USHORT xres, USHORT yres);
     void SetCustomDisplay(VIOGPU_MODE_SNAPSHOT *pSnapshot, USHORT xres, USHORT yres);

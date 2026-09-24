@@ -68,7 +68,8 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     RtlZeroMemory(m_CurrentModes, sizeof(m_CurrentModes));
     m_CurrentModes[0].DispInfo.TargetId = D3DDDI_ID_UNINITIALIZED;
 
-    NTSTATUS Status = RefreshModeSnapshot(&m_CurrentModes[0].DispInfo);
+    NTSTATUS SnapshotStatus = RefreshModeSnapshot(&m_CurrentModes[0].DispInfo);
+    NTSTATUS Status = SnapshotStatus;
     if (!NT_SUCCESS(Status))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("%s GetModeList failed with %x\n", __FUNCTION__, Status));
@@ -125,6 +126,18 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     InterlockedExchange(&m_sourceAddressQueueHead, 0);
     InterlockedExchange(&m_sourceAddressQueueTail, 0);
     InterlockedExchange(&m_sourceQueueFullCount, 0);
+
+    // Losing the initial snapshot is not recoverable the way a later refresh is: there is no
+    // previous generation for the DDIs to read, so do not pretend to have started.
+    VIOGPU_MODE_SNAPSHOT *pProbe = AcquireModes();
+    if (pProbe == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s: no mode snapshot available, failing start (0x%x)\n", __FUNCTION__, SnapshotStatus));
+        StopVsyncTimer();
+        return NT_SUCCESS(SnapshotStatus) ? STATUS_UNSUCCESSFUL : SnapshotStatus;
+    }
+    ReleaseModes(pProbe);
 
     StartVsyncTimer();
     return Status;
@@ -420,6 +433,7 @@ NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSou
         }
 
         pCurrentMode->Flags.FullscreenPresent = TRUE;
+        BOOLEAN Matched = FALSE;
         for (USHORT ModeIndex = 0; ModeIndex < pSnapshot->ModeCount; ++ModeIndex)
         {
             PVIDEO_MODE_INFORMATION pModeInfo = &pSnapshot->Modes[ModeIndex];
@@ -429,8 +443,22 @@ NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSou
                 // The preferred mode for the generation is chosen by the builder from the
                 // host-requested size; do not overwrite it here with whatever dxgkrnl pinned.
                 Status = SetCurrentMode(pSnapshot->ModeNumbers[ModeIndex], pCurrentMode, pSnapshot);
+                Matched = TRUE;
                 break;
             }
+        }
+        if (!Matched)
+        {
+            // dxgkrnl can pin a mode from an enumeration that a newer snapshot has since replaced.
+            // Keep the vendor's "success" contract for a commit we cannot map (failing here would
+            // make dxgkrnl re-negotiate the whole VidPN), but never let it pass silently.
+            DbgPrint(TRACE_LEVEL_WARNING,
+                     ("%s: pinned %ux%u is not in snapshot generation %u (%u modes)\n",
+                      __FUNCTION__,
+                      pCurrentMode->DispInfo.Width,
+                      pCurrentMode->DispInfo.Height,
+                      pSnapshot->Generation,
+                      pSnapshot->ModeCount));
         }
         ReleaseModes(pSnapshot);
     }
@@ -660,19 +688,22 @@ NTSTATUS VioGpuVidPN::BuildModeSnapshot(VIOGPU_MODE_SNAPSHOT **ppSnapshot)
     RtlZeroMemory(Edids, sizeof(Edids));
     BOOLEAN HasEdid = FALSE;
 
+    const UCHAR *pPrimaryEdid = NULL;
     if (virtio_is_feature_enabled(m_pAdapter->m_u64HostFeatures, VIRTIO_GPU_F_EDID))
     {
-        GetEdids(Edids, &HasEdid);
+        GetEdids(Edids, MAX_CHILDREN, &HasEdid);
+        // A fetch that did not succeed must fall back to the built-in table, exactly as the
+        // vendor's GetEdidData() did (m_bEDID == FALSE -> g_gpu_edid).  Parsing the still-zeroed
+        // Edids[0] instead would build the mode list from an all-zero EDID.
+        pPrimaryEdid = HasEdid ? Edids[0] : g_gpu_edid;
     }
     else
     {
         // No EDID feature: parse the built-in table, with its usual correctness fixes applied.
         RtlCopyMemory(Edids[0], g_gpu_edid, EDID_V1_BLOCK_SIZE);
         FixEdid(Edids[0]);
+        pPrimaryEdid = Edids[0];
     }
-
-    // With the feature but a failed fetch this is still the built-in table, as before.
-    const UCHAR *pPrimaryEdid = Edids[0];
 
     ModeCount = AddEdidModes(pPrimaryEdid, pModes, kMaxModes);
     if (ModeCount < 0 || ModeCount >= kMaxModes)
@@ -703,6 +734,8 @@ NTSTATUS VioGpuVidPN::BuildModeSnapshot(VIOGPU_MODE_SNAPSHOT **ppSnapshot)
     RtlZeroMemory(pSnapshot->Modes, sizeof(VIDEO_MODE_INFORMATION) * Total);
     RtlZeroMemory(pSnapshot->ModeNumbers, sizeof(USHORT) * Total);
 
+    // m_ModeGeneration is only ever touched by the single serialized snapshot writer: Start()
+    // runs before the config work thread exists, and that thread is stopped before teardown.
     pSnapshot->Generation = ++m_ModeGeneration;
     pSnapshot->ModeCount = Total;
     pSnapshot->HasEdid = HasEdid;
@@ -734,7 +767,7 @@ NTSTATUS VioGpuVidPN::BuildModeSnapshot(VIOGPU_MODE_SNAPSHOT **ppSnapshot)
 
     for (ULONG idx = 0; idx < pSnapshot->ModeCount; idx++)
     {
-        DbgPrint(TRACE_LEVEL_FATAL,
+        DbgPrint(TRACE_LEVEL_VERBOSE,
                  ("type %d, XRes = %d, YRes = %d\n",
                   pSnapshot->ModeNumbers[idx],
                   pSnapshot->Modes[idx].VisScreenWidth,
@@ -1929,9 +1962,12 @@ PBYTE VioGpuVidPN::GetCTA861Data(const UCHAR *pEdid)
     return NULL;
 }
 
-BOOLEAN VioGpuVidPN::GetEdids(UCHAR (*Edids)[EDID_RAW_BLOCK_SIZE], BOOLEAN *pHasEdid)
+// Fetch each scanout's EDID into a caller-owned array of EdidCapacity blocks.  The host-supplied
+// scanout count is NOT trusted as a bound: it comes from device config, so the loop is clamped to
+// the caller's capacity rather than overrunning the caller's storage.
+BOOLEAN VioGpuVidPN::GetEdids(UCHAR (*Edids)[EDID_RAW_BLOCK_SIZE], UINT32 EdidCapacity, BOOLEAN *pHasEdid)
 {
-    if (Edids == NULL || pHasEdid == NULL)
+    if (Edids == NULL || pHasEdid == NULL || EdidCapacity == 0)
     {
         return FALSE;
     }
@@ -1939,9 +1975,19 @@ BOOLEAN VioGpuVidPN::GetEdids(UCHAR (*Edids)[EDID_RAW_BLOCK_SIZE], BOOLEAN *pHas
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
+    if (m_pAdapter->m_u32NumScanouts > EdidCapacity)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING,
+                 ("%s: host reports %u scanouts but only %u EDID slots exist; ignoring the rest\n",
+                  __FUNCTION__,
+                  m_pAdapter->m_u32NumScanouts,
+                  EdidCapacity));
+    }
+
+    UINT32 count = (m_pAdapter->m_u32NumScanouts < EdidCapacity) ? m_pAdapter->m_u32NumScanouts : EdidCapacity;
     PGPU_VBUFFER vbuf = NULL;
 
-    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts; i++)
+    for (UINT32 i = 0; i < count; i++)
     {
         vbuf = NULL;
         if (m_pAdapter->ctrlQueue.AskEdidInfo(&vbuf, i) && m_pAdapter->ctrlQueue.GetEdidInfo(vbuf, i, Edids[i]))
