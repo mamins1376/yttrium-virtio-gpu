@@ -37,6 +37,7 @@
 #include "bitops.h"
 #include "viogpum.h"
 #include "viogpu_device.h"
+#include "edid.h"
 
 typedef struct _VIOGPU_SUBMIT_ESCAPE_CTX
 {
@@ -543,13 +544,15 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
     VIOGPU_ASSERT(pDeviceDescriptor != NULL);
     VIOGPU_ASSERT(ChildUid < MAX_CHILDREN);
 
-    // Windows is (re)reading the monitor descriptor.  If the host changed the scanout size,
-    // fetch the new EDID first so the OS builds its monitor modes from the requested timing.
-    vidpn.RefreshModesIfDirty();
-    PBYTE edid = vidpn.GetEdidData(ChildUid);
+    // Serve the descriptor from the published snapshot only.  No virtio I/O and no table rebuild
+    // happen here: dxgkrnl may call this at any time, and the EDID the host last reported was
+    // already fetched and validated by the config work thread.
+    VIOGPU_MODE_SNAPSHOT *pSnapshot = vidpn.AcquireModes();
+    PBYTE edid = (pSnapshot != NULL && pSnapshot->HasEdid) ? pSnapshot->Edids[ChildUid] : (PBYTE)g_gpu_edid;
 
-    if (!edid)
+    if (edid == NULL)
     {
+        vidpn.ReleaseModes(pSnapshot);
         return STATUS_GRAPHICS_CHILD_DESCRIPTOR_NOT_SUPPORTED;
     }
     else if (pDeviceDescriptor->DescriptorOffset < EDID_RAW_BLOCK_SIZE)
@@ -558,8 +561,11 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
                         (EDID_RAW_BLOCK_SIZE - pDeviceDescriptor->DescriptorOffset));
         RtlCopyMemory(pDeviceDescriptor->DescriptorBuffer, (edid + pDeviceDescriptor->DescriptorOffset), len);
         pDeviceDescriptor->DescriptorLength = len;
+        vidpn.ReleaseModes(pSnapshot);
         return STATUS_SUCCESS;
     }
+
+    vidpn.ReleaseModes(pSnapshot);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return STATUS_MONITOR_NO_MORE_DESCRIPTOR_DATA;
@@ -2642,19 +2648,28 @@ void VioGpuAdapter::ConfigChanged(void)
     virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_read), &events_read, sizeof(m_u32NumScanouts));
     if (events_read & VIRTIO_GPU_EVENT_DISPLAY)
     {
-        vidpn.GetDisplayInfo();
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(m_u32NumScanouts));
 
-        // The SPICE client asked for a new size (the console window was resized).  The OS only
-        // re-reads the monitor EDID and re-enumerates its mode sets when the child transitions,
-        // so unplug/replug it: QueryDeviceDescriptor then serves the *new* EDID, whose preferred
-        // detailed timing is the requested size, and the desktop follows the window.
-        // The tables themselves are rebuilt lazily in RefreshModesIfDirty() -- see the comment
-        // there for why they must not be rebuilt from this thread.
-        vidpn.MarkModesDirty();
-        UpdateChildStatus(FALSE);
-        UpdateChildStatus(TRUE);
+        // The SPICE client asked for a new size (the console window was resized).  Rebuild the
+        // EDID + mode tables HERE, on this PASSIVE worker, and publish them as a new immutable
+        // snapshot; dxgkrnl's callbacks then only ever read that snapshot, so no virtio traffic
+        // and no table mutation happens on a callback path.
+        vidpn.RefreshModeSnapshot(NULL);
+
+        // The OS only re-reads the monitor descriptor and re-enumerates its mode sets when the
+        // child transitions, so unplug/replug it once for this drained event.  Reported separately
+        // so a failed reconnect does not go unnoticed.
+        NTSTATUS DisconnectStatus = UpdateChildStatus(FALSE);
+        NTSTATUS ConnectStatus = UpdateChildStatus(TRUE);
+        if (!NT_SUCCESS(DisconnectStatus) || !NT_SUCCESS(ConnectStatus))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s: child re-arrival failed, disconnect 0x%x connect 0x%x\n",
+                      __FUNCTION__,
+                      DisconnectStatus,
+                      ConnectStatus));
+        }
     }
 }
 

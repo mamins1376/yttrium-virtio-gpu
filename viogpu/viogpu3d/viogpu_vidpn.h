@@ -39,6 +39,27 @@ typedef struct _CURRENT_MODE
     } FrameBuffer;
 } CURRENT_MODE;
 
+// An immutable, reference-counted snapshot of everything the mode-reporting and monitor-descriptor
+// paths read: the display EDIDs, the mode table derived from them, and the indices this driver
+// prefers.  It is built entirely off to the side by the config work thread and published by a
+// pointer swap, so no dxgkrnl callback ever has to talk to the virtio control queue, and nothing
+// the callbacks read can be mutated underneath them.  See VioGpuVidPN::AcquireModes().
+//
+// Nothing here may be modified after publication, not even the indices: they describe this
+// generation's preferred mode, which is exactly the host-requested size.
+typedef struct _VIOGPU_MODE_SNAPSHOT
+{
+    volatile LONG Refs; // publication reference + one per concurrent reader
+    ULONG Generation;
+    ULONG ModeCount;
+    ULONG CurrentModeIndex; // preferred mode for this generation (the host-requested size)
+    ULONG CustomModeIndex;  // the trailing entry carrying the host-requested size
+    BOOLEAN HasEdid;        // FALSE => Edids is unused and g_gpu_edid is reported instead
+    VIDEO_MODE_INFORMATION *Modes;
+    USHORT *ModeNumbers;
+    UCHAR Edids[MAX_CHILDREN][EDID_RAW_BLOCK_SIZE];
+} VIOGPU_MODE_SNAPSHOT;
+
 class VioGpuVidPN
 {
   public:
@@ -60,35 +81,30 @@ class VioGpuVidPN
     NTSTATUS
     UpdateActiveVidPnPresentPath(_In_ CONST DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH *CONST pUpdateActiveVidPnPresentPath);
 
-    NTSTATUS SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode);
-    ULONG GetModeCount(void)
-    {
-        return m_ModeCount;
-    }
+    NTSTATUS SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode, VIOGPU_MODE_SNAPSHOT *pSnapshot);
     VOID BlackOutScreen(CURRENT_MODE *pCurrentMod);
 
-    NTSTATUS GetModeList(DXGK_DISPLAY_INFORMATION *pDispInfo);
+    // Rebuild the EDID + mode tables from the host and publish them as a new snapshot.  May block
+    // on the virtio control queue and must only be called from PASSIVE_LEVEL, off the dxgkrnl
+    // callback paths: the config work thread (a display event) and Start().
+    NTSTATUS RefreshModeSnapshot(DXGK_DISPLAY_INFORMATION *pDispInfo);
+    // Take a reference on the current snapshot.  NULL if none is published yet.
+    VIOGPU_MODE_SNAPSHOT *AcquireModes(void);
+    void ReleaseModes(VIOGPU_MODE_SNAPSHOT *pSnapshot);
 
     void CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode);
     void DestroyFrameBufferObj(BOOLEAN bReset);
 
     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);
-    PBYTE GetEdidData(UINT Idx);
 
-    PBYTE GetCTA861Data(void);
-    void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
-    BOOLEAN GetDisplayInfo(void);
-    int ProcessEdid(void);
-    void FixEdid(void);
-    BOOLEAN GetEdids(void);
-    int AddEdidModes(void);
-    void MarkModesDirty(void)
-    {
-        InterlockedExchange(&m_ModesDirty, TRUE);
-    }
-    BOOLEAN RefreshModesIfDirty(void);
-    BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
-    void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
+    PBYTE GetCTA861Data(const UCHAR *pEdid);
+    void SetVideoModeInfo(PVIDEO_MODE_INFORMATION pMode, UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
+    BOOLEAN GetDisplayInfo(VIOGPU_MODE_SNAPSHOT *pSnapshot);
+    void FixEdid(UCHAR *pEdid);
+    BOOLEAN GetEdids(UCHAR (*Edids)[EDID_RAW_BLOCK_SIZE], BOOLEAN *pHasEdid);
+    int AddEdidModes(const UCHAR *Edid, VIOGPU_DISP_MODE *pModes, int Capacity);
+    BOOLEAN UpdateModes(VIOGPU_DISP_MODE *pModes, int Capacity, int &cnt, USHORT xres, USHORT yres);
+    void SetCustomDisplay(VIOGPU_MODE_SNAPSHOT *pSnapshot, USHORT xres, USHORT yres);
 
     NTSTATUS EscapeCustomResoulution(VIOGPU_DISP_MODE *resolution);
 
@@ -128,30 +144,38 @@ class VioGpuVidPN
   private:
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
                                   CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath);
-    NTSTATUS AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes);
-    NTSTATUS AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INTERFACE *pVidPnSourceModeSetInterface,
+    NTSTATUS AddSingleMonitorMode(VIOGPU_MODE_SNAPSHOT *pSnapshot,
+                                  _In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes);
+    NTSTATUS AddSingleSourceMode(VIOGPU_MODE_SNAPSHOT *pSnapshot,
+                                 _In_ CONST DXGK_VIDPNSOURCEMODESET_INTERFACE *pVidPnSourceModeSetInterface,
                                  D3DKMDT_HVIDPNSOURCEMODESET hVidPnSourceModeSet,
                                  D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId);
-    NTSTATUS AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTERFACE *pVidPnTargetModeSetInterface,
+    NTSTATUS AddSingleTargetMode(VIOGPU_MODE_SNAPSHOT *pSnapshot,
+                                 _In_ CONST DXGK_VIDPNTARGETMODESET_INTERFACE *pVidPnTargetModeSetInterface,
                                  D3DKMDT_HVIDPNTARGETMODESET hVidPnTargetModeSet,
                                  _In_opt_ CONST D3DKMDT_VIDPN_SOURCE_MODE *pVidPnPinnedSourceModeInfo,
                                  D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId);
+    // Same body as the public EnumVidPnCofuncModality, but holding one acquired snapshot so that
+    // every mode it reports comes from a single generation.
+    NTSTATUS EnumVidPnCofuncModalityInternal(_In_ CONST DXGKARG_ENUMVIDPNCOFUNCMODALITY *CONST pEnumCofuncModality,
+                                              VIOGPU_MODE_SNAPSHOT *pSnapshot);
     D3DDDI_VIDEO_PRESENT_SOURCE_ID FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, BOOLEAN DefaultToZero);
     VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo);
+    NTSTATUS BuildModeSnapshot(VIOGPU_MODE_SNAPSHOT **ppSnapshot);
+    void FreeSnapshot(VIOGPU_MODE_SNAPSHOT *pSnapshot);
 
     VioGpuAdapter *m_pAdapter;
     DXGKRNL_INTERFACE *m_pDxgkInterface;
 
     CURRENT_MODE m_CurrentModes[MAX_VIEWS];
 
-    PVIDEO_MODE_INFORMATION m_ModeInfo;
-    ULONG m_ModeCount;
-    PUSHORT m_ModeNumbers;
-    USHORT m_CurrentModeIndex;
-    USHORT m_CustomModeIndex;
-    BYTE m_EDIDs[MAX_CHILDREN][EDID_RAW_BLOCK_SIZE];
-    BOOLEAN m_bEDID;
-    volatile LONG m_ModesDirty = 0;
+    // Published snapshot.  Guarded by m_ModesLock for the pointer swap and the reference count
+    // only; the lock is never held while allocating, calling the control queue, or calling into
+    // dxgkrnl.  A FAST_MUTEX, not a KSPIN_LOCK: the snapshot is paged, and a spinlock would raise
+    // IRQL before the reference count is touched.
+    VIOGPU_MODE_SNAPSHOT *m_pModes;
+    FAST_MUTEX m_ModesLock;
+    ULONG m_ModeGeneration;
 
     DXGK_DISPLAY_INFORMATION m_SystemDisplayInfo;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_SystemDisplaySourceId;
